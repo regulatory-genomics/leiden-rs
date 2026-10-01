@@ -22,7 +22,9 @@ mod rng;
 
 pub use error::LeidenError;
 pub use graph::Graph;
-pub use leiden::{leiden, leiden_simple, strength, Objective};
+pub use leiden::{
+    leiden, leiden_parallel, leiden_simple, leiden_simple_parallel, strength, Objective,
+};
 pub use modularity::modularity;
 pub use rng::{shuffle, Pcg32, Rng};
 

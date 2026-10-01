@@ -16,7 +16,7 @@ mod common;
 
 use std::time::Instant;
 
-use leiden_rs::{leiden_simple, Graph, Objective, Pcg32};
+use leiden_rs::{leiden_simple, leiden_simple_parallel, Graph, Objective, Pcg32};
 
 /// Cheap xorshift RNG for deterministic graph generation.
 struct Lcg(u64);
@@ -348,6 +348,41 @@ fn bench_rust(
     (times, nb)
 }
 
+/// Run the parallel Rust port `k` times in-process, returning (run times in
+/// µs, nb_clusters of the last run).
+fn bench_rust_parallel(
+    graph: &Graph,
+    weights: Option<&[f64]>,
+    objective: Objective,
+    resolution: f64,
+    n_iterations: i64,
+    seed: u64,
+    k: usize,
+) -> (Vec<f64>, i64) {
+    let mut times = Vec::with_capacity(k);
+    let mut nb = -1_i64;
+    for _ in 0..k {
+        let mut membership: Vec<i64> = Vec::new();
+        let mut rng = Pcg32::seeded(seed);
+        let t0 = Instant::now();
+        let outcome = leiden_simple_parallel(
+            graph,
+            weights,
+            objective,
+            resolution,
+            0.01,
+            false,
+            n_iterations,
+            &mut membership,
+            &mut rng,
+        )
+        .unwrap();
+        times.push(t0.elapsed().as_secs_f64() * 1e6);
+        nb = outcome.nb_clusters;
+    }
+    (times, nb)
+}
+
 fn main() {
     let bin = common::c_helper("leiden_bench").expect("failed to build the C benchmark driver");
     let seed = 20_241_001;
@@ -355,7 +390,7 @@ fn main() {
     let only = std::env::var("LEIDEN_BENCH_ONLY").ok();
 
     println!(
-        "{:<14} {:>8} {:<11} {:>4} {:>12} {:>12} {:>12} {:>12} {:>8} match",
+        "{:<14} {:>8} {:<11} {:>4} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>8}",
         "graph",
         "edges",
         "objective",
@@ -364,12 +399,16 @@ fn main() {
         "C med µs",
         "Rs best µs",
         "Rs med µs",
-        "C/Rs"
+        "Rp best µs",
+        "Rp med µs",
+        "C/Rs",
+        "C/Rp"
     );
-    println!("{}", "-".repeat(105));
+    println!("{}", "-".repeat(132));
 
     let mut total_c = 0.0_f64;
     let mut total_r = 0.0_f64;
+    let mut total_p = 0.0_f64;
 
     for case in cases() {
         if let Some(pattern) = &only {
@@ -427,19 +466,32 @@ fn main() {
                     seed,
                     k,
                 );
+                let (p_times, _p_nb) = bench_rust_parallel(
+                    &graph,
+                    case.weights.as_deref(),
+                    objective,
+                    resolution,
+                    n_iterations,
+                    seed,
+                    k,
+                );
 
                 let c_best = c_times.iter().cloned().fold(f64::INFINITY, f64::min);
                 let c_med = median(&mut c_times.clone());
                 let r_best = r_times.iter().cloned().fold(f64::INFINITY, f64::min);
                 let r_med = median(&mut r_times.clone());
+                let p_best = p_times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let p_med = median(&mut p_times.clone());
                 let speedup = c_med / r_med;
+                let speedup_p = c_med / p_med;
                 let matched = c_nb == r_nb;
 
                 total_c += c_med * k as f64;
                 total_r += r_med * k as f64;
+                total_p += p_med * k as f64;
 
                 println!(
-                    "{:<14} {:>8} {:<11} {:>4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>7.2}x {}",
+                    "{:<14} {:>8} {:<11} {:>4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>7.2}x {:>7.2}x {}",
                     case.name,
                     case.edges.len(),
                     obj_name,
@@ -448,16 +500,20 @@ fn main() {
                     c_med,
                     r_best,
                     r_med,
+                    p_best,
+                    p_med,
                     speedup,
+                    speedup_p,
                     if matched { "ok" } else { "MISMATCH" }
                 );
             }
         }
     }
 
-    println!("{}", "-".repeat(105));
+    println!("{}", "-".repeat(132));
     println!(
-        "total median-weighted time: C {total_c:.0} µs, Rust {total_r:.0} µs (C/Rust = {:.2}x)",
-        total_c / total_r
+        "total median-weighted time: C {total_c:.0} µs, Rust seq {total_r:.0} µs, Rust par {total_p:.0} µs (C/Rs = {:.2}x, C/Rp = {:.2}x)",
+        total_c / total_r,
+        total_c / total_p
     );
 }

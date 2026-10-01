@@ -6,10 +6,14 @@ description = "Rust port of the igraph Leiden community detection implementation
 license = "GPL-2.0-or-later"
 
 [dependencies]
+rayon = "1"
 
 [[bench]]
 name = "compare"
 harness = false
+
+[profile.bench]
+debug = true
 
 [profile.test]
 opt-level = 2

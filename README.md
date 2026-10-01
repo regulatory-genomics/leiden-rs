@@ -12,6 +12,9 @@ community-detection implementation (`src/community/leiden.c`, commit
   simplified interface selecting one of three objective functions:
   generalized modularity, the Constant Potts Model (CPM), or an
   Erdős–Rényi (ER) null model.
+- **`leiden_parallel()` / `leiden_simple_parallel()`** — parallel variants
+  of the two entry points (rayon-based), see
+  [Parallel implementation](#parallel-implementation) below.
 - **`modularity()`** — port of `igraph_modularity()`.
 - **`strength()`** — port of `igraph_strength()` for all vertices.
 - **`Graph`** — the internal graph representation with igraph's exact
@@ -70,6 +73,17 @@ let outcome = leiden_simple(
 println!("{} clusters, quality {}", outcome.nb_clusters, outcome.quality);
 ```
 
+The parallel variant has the same signature and usage; swap the call to
+`leiden_simple_parallel` (or `leiden_parallel` for the generic interface):
+
+```rust
+let outcome = leiden_rs::leiden_simple_parallel(
+    &graph, None, Objective::Modularity, 1.0, 0.01, false, 2,
+    &mut membership, &mut rng,
+)
+.unwrap();
+```
+
 For directed graphs the generic `leiden()` interface takes explicit vertex
 out/in weight vectors; `leiden_simple()` computes them via `strength()`
 just as `igraph_community_leiden_simple()` does.
@@ -90,7 +104,9 @@ All gates are checked by `cargo test`:
   graphs, comparing incidence-list construction against C.
 - **Properties** (`tests/properties.rs`): determinism, membership validity,
   cluster connectivity, quality non-decreasing with more iterations, and
-  quality cross-checked against the independent `modularity()` port.
+  quality cross-checked against the independent `modularity()` port — for
+  both the sequential and the parallel variants (including parallel
+  determinism across thread-pool configurations).
 - **RNG stream** (`tests/rng_stream_test.rs`): the PCG32 stream matches C
   values for `get_integer`, and uniform sampling.
 
@@ -145,6 +161,57 @@ Note: when the reference igraph is built with FMA contraction (default
 CPM cases. This is a floating-point rounding artifact of the FMA build,
 not a port defect — with the canonical `-ffp-contract=off` reference
 build all cluster counts match bit-for-bit (see the differential tests).
+
+## Parallel implementation
+
+`leiden_parallel()` and `leiden_simple_parallel()` run the same Leiden
+algorithm with a rayon-parallel variant of the **cluster refinement**
+phase (the step that decides how each cluster is split before
+aggregation):
+
+- The clusters of the current level are split into chunks of at least 32
+  clusters each (at most `rayon::current_num_threads()` chunks, and only
+  when there are enough clusters to justify it); smaller cluster counts
+  are refined sequentially.
+- Each chunk is refined independently by a rayon task that owns its
+  scratch workspace (created once, reused across levels and iterations)
+  and its own `Pcg32` sub-RNG, seeded from one 64-bit value drawn per
+  chunk from the master RNG stream **in chunk order**.
+- The per-chunk local cluster IDs are renumbered consecutively in cluster
+  order, reproducing the sequential numbering semantics.
+
+Because the chunk boundaries, seed assignment and renumbering depend only
+on the cluster order — never on thread scheduling — the result is
+**deterministic run-to-run** for a given thread configuration.
+
+Guarantees (checked by the parallel property tests in
+`tests/properties.rs`):
+
+- valid partition: consecutive cluster IDs, every cluster (weakly)
+  connected;
+- per-iteration quality never decreases with more iterations;
+- the returned quality matches the independent `modularity()` port;
+- deterministic for a fixed thread-pool configuration;
+- quality lands in the same ballpark as the sequential result.
+
+**Not** bit-identical to the sequential `leiden()` / C igraph: the
+refinement's random decisions are drawn from per-chunk streams instead of
+a single stream, so the refined partitions (and hence the final
+membership and quality) generally differ. The local-moving phase and the
+aggregation step are unchanged (still sequential), and the refinement
+phase is the dominant parallelizable component — the sequential
+dependency chain of the local-moving loop is not parallelized.
+
+Measured impact (`RAYON_NUM_THREADS=16`, 128-core Linux x86-64; timings
+are load-sensitive, so treat ratios as approximate): the parallel
+variant beats C igraph by up to **≈2×** on the cases where refinement
+dominates (e.g. ba-10k CPM until stable: 2.0×; ba-1k CPM until stable:
+1.4×; planted-10k-w CPM until stable: 1.3×; ba-10k modularity 2 it:
+1.3×), and is roughly at parity with the sequential port on the
+remaining cases — on some graphs a differently-seeded refinement
+converges in more iterations, which can make the parallel variant
+slower than sequential (e.g. random-100k-w CPM until stable). Choose
+based on workload; the sequential port remains the bit-exact reference.
 
 ## License
 

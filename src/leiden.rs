@@ -9,8 +9,10 @@
 
 use crate::error::{format_g, LeidenError, Result};
 use crate::graph::{Graph, Inclist};
-use crate::rng::Rng;
+use crate::rng::{Pcg32, Rng};
 use crate::Outcome;
+
+use rayon::prelude::*;
 
 /// Objective function for [`leiden_simple`], mirroring
 /// `igraph_leiden_objective_t`.
@@ -538,6 +540,99 @@ fn merge_vertices(
 /// clusters out of a membership vector. `clusters` must already have at
 /// least as many items as the number of clusters in the membership vector,
 /// and each item must be empty.
+/// Parallel variant of the cluster refinement phase: refines the clusters in
+/// parallel chunks, each chunk with its own RNG stream seeded from
+/// `chunk_seeds[ci]`, then renumbers the per-chunk local clusters
+/// consecutively in cluster order.
+///
+/// Deterministic regardless of thread scheduling: the chunk boundaries, the
+/// seed assignment and the renumbering all depend only on the cluster order.
+/// Each chunk task owns a workspace from `pool` (created once and reused
+/// across levels), so there is no allocation churn and no shared mutable
+/// state; `membership` and the weight slices are only read.
+#[allow(clippy::too_many_arguments)]
+fn refine_clusters_parallel(
+    edges_per_vertex: &Inclist,
+    edge_weights: &[f64],
+    vertex_out_weights: &[f64],
+    vertex_in_weights: Option<&[f64]>,
+    clusters: &[Vec<i64>],
+    membership: &[i64],
+    resolution: f64,
+    beta: f64,
+    chunk_seeds: &[u64],
+    pool: &mut Vec<Workspace>,
+    vcount: usize,
+) -> Result<(Vec<i64>, i64)> {
+    let n_chunks = chunk_seeds.len();
+    let chunk_len = if n_chunks == 0 {
+        0
+    } else {
+        clusters.len().div_ceil(n_chunks)
+    };
+
+    // Grow the workspace pool to n_chunks entries. Workspaces are created
+    // once and reused across levels and iterations.
+    if pool.len() < n_chunks {
+        pool.resize_with(n_chunks, Workspace::default);
+    }
+
+    // Refine each chunk (in parallel). Each chunk writes the refined
+    // membership of its clusters into its own workspace buffer (local
+    // cluster IDs, numbered from 0 within the chunk) and reports the number
+    // of local clusters it created.
+    let counts: Vec<Result<i64>> = (0..n_chunks)
+        .into_par_iter()
+        .zip(pool.par_iter_mut())
+        .map(|(ci, ws)| {
+            let s = (ci * chunk_len).min(clusters.len());
+            let e = (s + chunk_len).min(clusters.len());
+            // The refined buffer is indexed by vertex ID. Grow it if needed,
+            // but never shrink it: entries beyond vcount are never read.
+            if ws.mg_refined_membership.len() < vcount {
+                ws.mg_refined_membership.resize(vcount, 0);
+            }
+            let mut rng = Pcg32::seeded(chunk_seeds[ci]);
+            let mut count: i64 = 0;
+            for (li, cluster) in clusters[s..e].iter().enumerate() {
+                merge_vertices(
+                    edges_per_vertex,
+                    edge_weights,
+                    vertex_out_weights,
+                    vertex_in_weights,
+                    cluster,
+                    membership,
+                    (s + li) as i64,
+                    resolution,
+                    beta,
+                    &mut count,
+                    &mut rng,
+                    ws,
+                )?;
+            }
+            Ok(count)
+        })
+        .collect();
+
+    // Renumber the per-chunk local clusters consecutively in cluster order,
+    // reproducing the sequential numbering semantics.
+    let mut refined_out = vec![0_i64; vcount];
+    let mut offset: i64 = 0;
+    for (ci, count) in counts.into_iter().enumerate() {
+        let count = count?;
+        let s = (ci * chunk_len).min(clusters.len());
+        let e = (s + chunk_len).min(clusters.len());
+        let chunk_refined = &pool[ci].mg_refined_membership;
+        for cluster in &clusters[s..e] {
+            for &v in cluster {
+                refined_out[v as usize] = offset + chunk_refined[v as usize];
+            }
+        }
+        offset += count;
+    }
+    Ok((refined_out, offset))
+}
+
 fn get_clusters(membership: &[i64], clusters: &mut [Vec<i64>]) {
     for (i, &m) in membership.iter().enumerate() {
         clusters[m as usize].push(i as i64);
@@ -750,6 +845,8 @@ fn community_leiden_core(
     rng: &mut dyn Rng,
     level0_eps: &Inclist,
     ws: &mut Workspace,
+    pool: &mut Vec<Workspace>,
+    parallel: bool,
 ) -> Result<f64> {
     let n = graph.vcount() as usize;
     let directed = vertex_in_weights.is_some();
@@ -835,22 +932,67 @@ fn community_leiden_core(
                 ws.mg_refined_membership
                     .resize(cur_graph.vcount() as usize, 0);
             }
-            ws.mg_refined_membership.fill(0);
-            for (c, cluster) in clusters.iter().enumerate() {
-                merge_vertices(
+            if parallel {
+                // Draw one seed per chunk from the master RNG stream, in
+                // chunk order, so the result is deterministic regardless of
+                // thread scheduling. Each chunk refines its clusters with
+                // its own sub-RNG seeded from that seed.
+                //
+                // Chunks are kept at least MIN_CHUNK clusters large so that
+                // the per-task overhead is amortized; smaller cluster counts
+                // are refined sequentially.
+                const MIN_CHUNK: usize = 32;
+                let n_threads = rayon::current_num_threads();
+                let nb_clusters_usize = *nb_clusters as usize;
+                let n_chunks = if nb_clusters_usize >= 2 * MIN_CHUNK {
+                    n_threads.min(nb_clusters_usize / MIN_CHUNK)
+                } else {
+                    1
+                };
+                let mut chunk_seeds = Vec::with_capacity(n_chunks);
+                for _ in 0..n_chunks {
+                    chunk_seeds.push(rng.random_bits_u64(64));
+                }
+                let (refined, count) = refine_clusters_parallel(
                     edges_per_vertex,
                     cur_ew,
                     cur_vow,
                     cur_viw,
-                    cluster,
+                    &clusters,
                     cur_mem,
-                    c as i64,
                     resolution,
                     beta,
-                    &mut nb_refined_clusters,
-                    rng,
-                    ws,
+                    &chunk_seeds,
+                    pool,
+                    cur_graph.vcount() as usize,
                 )?;
+                if count >= cur_graph.vcount() {
+                    // Refinement didn't aggregate anything: aggregate on the
+                    // basis of the actual clustering (same as sequential).
+                    ws.mg_refined_membership.copy_from_slice(cur_mem);
+                    nb_refined_clusters = *nb_clusters;
+                } else {
+                    ws.mg_refined_membership.copy_from_slice(&refined);
+                    nb_refined_clusters = count;
+                }
+            } else {
+                ws.mg_refined_membership.fill(0);
+                for (c, cluster) in clusters.iter().enumerate() {
+                    merge_vertices(
+                        edges_per_vertex,
+                        cur_ew,
+                        cur_vow,
+                        cur_viw,
+                        cluster,
+                        cur_mem,
+                        c as i64,
+                        resolution,
+                        beta,
+                        &mut nb_refined_clusters,
+                        rng,
+                        ws,
+                    )?;
+                }
             }
 
             // If refinement didn't aggregate anything, we aggregate on the
@@ -989,7 +1131,7 @@ pub(crate) fn reindex_membership(membership: &mut [i64], new_to_old: Option<&mut
 /// in place; it must have length `vcount` (or be resized appropriately when
 /// `start` is `false`).
 #[allow(clippy::too_many_arguments)]
-pub fn leiden(
+fn leiden_impl(
     graph: &Graph,
     edge_weights: Option<&[f64]>,
     vertex_out_weights: Option<&[f64]>,
@@ -1000,6 +1142,7 @@ pub fn leiden(
     n_iterations: i64,
     membership: &mut Vec<i64>,
     rng: &mut dyn Rng,
+    parallel: bool,
 ) -> Result<Outcome> {
     let vcount = graph.vcount();
     let ecount = graph.ecount();
@@ -1100,6 +1243,9 @@ pub fn leiden(
     // optimization that does not affect the results.
     let level0_eps = graph.inclist();
     let mut ws = Workspace::default();
+    // Workspaces for the parallel refinement chunks (grown on demand,
+    // reused across iterations and levels).
+    let mut pool: Vec<Workspace> = Vec::new();
 
     while if n_iterations < 0 {
         changed
@@ -1119,6 +1265,8 @@ pub fn leiden(
             rng,
             &level0_eps,
             &mut ws,
+            &mut pool,
+            parallel,
         )?;
         itr += 1;
     }
@@ -1129,11 +1277,78 @@ pub fn leiden(
     })
 }
 
+/// Port of `igraph_community_leiden()` with a parallel variant of the
+/// refinement phase.
+///
+/// Runs the same Leiden algorithm as [`leiden`], but refines the clusters in
+/// parallel chunks, each with its own RNG stream. The result is a valid
+/// high-quality Leiden partition with all structural guarantees (connected
+/// clusters, non-decreasing per-iteration quality) and is deterministic
+/// run-to-run, but it is *not* bit-identical to the sequential [`leiden`]
+/// result, because the random decisions are drawn from per-chunk streams
+/// instead of a single stream.
+#[allow(clippy::too_many_arguments)]
+pub fn leiden_parallel(
+    graph: &Graph,
+    edge_weights: Option<&[f64]>,
+    vertex_out_weights: Option<&[f64]>,
+    vertex_in_weights: Option<&[f64]>,
+    resolution: f64,
+    beta: f64,
+    start: bool,
+    n_iterations: i64,
+    membership: &mut Vec<i64>,
+    rng: &mut dyn Rng,
+) -> Result<Outcome> {
+    leiden_impl(
+        graph,
+        edge_weights,
+        vertex_out_weights,
+        vertex_in_weights,
+        resolution,
+        beta,
+        start,
+        n_iterations,
+        membership,
+        rng,
+        true,
+    )
+}
+
+/// Sequential, bit-exact port of `igraph_community_leiden()`.
+#[allow(clippy::too_many_arguments)]
+pub fn leiden(
+    graph: &Graph,
+    edge_weights: Option<&[f64]>,
+    vertex_out_weights: Option<&[f64]>,
+    vertex_in_weights: Option<&[f64]>,
+    resolution: f64,
+    beta: f64,
+    start: bool,
+    n_iterations: i64,
+    membership: &mut Vec<i64>,
+    rng: &mut dyn Rng,
+) -> Result<Outcome> {
+    leiden_impl(
+        graph,
+        edge_weights,
+        vertex_out_weights,
+        vertex_in_weights,
+        resolution,
+        beta,
+        start,
+        n_iterations,
+        membership,
+        rng,
+        false,
+    )
+}
+
 /// Port of `igraph_community_leiden_simple()` (`leiden.c` lines
 /// 1353-1504): the simplified interface, choosing from a set of objective
 /// functions instead of supplying vertex weights.
 #[allow(clippy::too_many_arguments)]
-pub fn leiden_simple(
+fn leiden_simple_impl(
     graph: &Graph,
     weights: Option<&[f64]>,
     objective: Objective,
@@ -1143,6 +1358,7 @@ pub fn leiden_simple(
     n_iterations: i64,
     membership: &mut Vec<i64>,
     rng: &mut dyn Rng,
+    parallel: bool,
 ) -> Result<Outcome> {
     let vcount = graph.vcount();
     let ecount = graph.ecount();
@@ -1234,7 +1450,7 @@ pub fn leiden_simple(
         }
     }
 
-    let outcome = leiden(
+    let outcome = leiden_impl(
         graph,
         weights,
         Some(&vertex_out_weights),
@@ -1249,9 +1465,70 @@ pub fn leiden_simple(
         n_iterations,
         membership,
         rng,
+        parallel,
     )?;
 
     Ok(outcome)
+}
+
+/// Port of `igraph_community_leiden_simple()` with a parallel variant of the
+/// refinement phase.
+///
+/// Runs the same algorithm as [`leiden_simple`], but refines the clusters in
+/// parallel chunks. The result is a valid high-quality Leiden partition with
+/// all structural guarantees and is deterministic run-to-run, but it is *not*
+/// bit-identical to the sequential [`leiden_simple`] result.
+#[allow(clippy::too_many_arguments)]
+pub fn leiden_simple_parallel(
+    graph: &Graph,
+    weights: Option<&[f64]>,
+    objective: Objective,
+    resolution: f64,
+    beta: f64,
+    start: bool,
+    n_iterations: i64,
+    membership: &mut Vec<i64>,
+    rng: &mut dyn Rng,
+) -> Result<Outcome> {
+    leiden_simple_impl(
+        graph,
+        weights,
+        objective,
+        resolution,
+        beta,
+        start,
+        n_iterations,
+        membership,
+        rng,
+        true,
+    )
+}
+
+/// Sequential, bit-exact port of `igraph_community_leiden_simple()`.
+#[allow(clippy::too_many_arguments)]
+pub fn leiden_simple(
+    graph: &Graph,
+    weights: Option<&[f64]>,
+    objective: Objective,
+    resolution: f64,
+    beta: f64,
+    start: bool,
+    n_iterations: i64,
+    membership: &mut Vec<i64>,
+    rng: &mut dyn Rng,
+) -> Result<Outcome> {
+    leiden_simple_impl(
+        graph,
+        weights,
+        objective,
+        resolution,
+        beta,
+        start,
+        n_iterations,
+        membership,
+        rng,
+        false,
+    )
 }
 
 /// Port of `igraph_strength()` for all vertices
