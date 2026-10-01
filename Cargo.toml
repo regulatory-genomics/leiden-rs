@@ -3,7 +3,7 @@ name = "leiden-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Rust port of the igraph Leiden community detection implementation (src/community/leiden.c)"
-license = "GPL-2.0-or-later"
+license = "MIT"
 
 [dependencies]
 rayon = "1"
