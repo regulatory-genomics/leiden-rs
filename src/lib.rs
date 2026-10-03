@@ -18,6 +18,7 @@ mod error;
 mod graph;
 mod leiden;
 mod modularity;
+mod profile;
 mod rng;
 
 pub use error::LeidenError;
@@ -26,6 +27,7 @@ pub use leiden::{
     leiden, leiden_parallel, leiden_simple, leiden_simple_parallel, strength, Objective,
 };
 pub use modularity::modularity;
+pub use profile::{resolution_profile, resolution_profile_bisect, total_internal_edges, ProfileEntry};
 pub use rng::{shuffle, Pcg32, Rng};
 
 /// Result of a Leiden community detection run.

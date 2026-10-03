@@ -1315,7 +1315,115 @@ pub fn leiden_parallel(
     )
 }
 
-/// Sequential, bit-exact port of `igraph_community_leiden()`.
+/// Sequential, bit-exact port of `igraph_community_leiden()` — the public
+/// interface with raw vertex weights.
+///
+/// Finds community structure using the Leiden algorithm (Traag, Waltman &
+/// van Eck, 2019), optimizing
+///
+/// - `1 / 2m sum_ij (A_ij - gamma n^out_i n^in_j) d(s_i, s_j)` in the
+///   undirected case, and
+/// - `1 / m sum_ij (A_ij - gamma n^out_i n^in_j) d(s_i, s_j)` in the
+///   directed case,
+///
+/// where `A` is the (weighted) adjacency matrix, `n^out`/`n^in` the vertex
+/// weights, `gamma` the resolution parameter and `d` the Kronecker delta.
+/// Larger resolutions give more, smaller communities.
+///
+/// Given the same seed and inputs, the result is bit-for-bit identical to C
+/// igraph's `igraph_community_leiden()`, including its random number
+/// stream. Use [`Pcg32`] as the RNG for that guarantee.
+///
+/// # Parameters
+///
+/// - `graph`: undirected edges are stored with `from >= to` (igraph's
+///   convention); self-loops are allowed.
+/// - `edge_weights`: `None` means every edge has weight 1. Weights need not
+///   be non-negative.
+/// - `vertex_out_weights` / `vertex_in_weights`: `None` means every vertex
+///   has weight 1. `vertex_in_weights` must be `None` for undirected
+///   graphs (in-weights equal out-weights); for directed graphs, `None`
+///   means in-weights equal out-weights, which effectively ignores edge
+///   directions.
+/// - `resolution`: γ, entering the objective above directly. Note the
+///   contrast with [`leiden_simple`]'s modularity objective, which
+///   normalizes γ by the total edge weight internally.
+/// - `beta`: the randomness of the refinement phase's split decisions;
+///   `0.01` is igraph's default. Higher values make the refinement noisy,
+///   which is the usual knob for escaping local optima at the cost of
+///   run-to-run stability across seeds.
+/// - `start`: start from the given membership vector (`true`) or from a
+///   singleton partition (`false`).
+/// - `n_iterations`: number of times to run the core Leiden algorithm. A
+///   negative value keeps iterating until an iteration does not change the
+///   clustering.
+/// - `membership`: both used as the initial membership (when `start` is
+///   `true`; it must then have length `vcount`) and updated in place with
+///   the final partition (consecutive cluster indices starting at 0).
+/// - `rng`: the random number generator; [`Pcg32::seeded`] reproduces
+///   igraph's stream.
+///
+/// # Sensible defaults
+///
+/// | Parameter | Default | Rationale |
+/// |---|---|---|
+/// | `resolution` | `1.0` | γ = 1 for modularity; for unit vertex weights (CPM-like) the natural scale depends on the average degree — sweep it with [`resolution_profile`] or [`resolution_profile_bisect`]. |
+/// | `beta` | `0.01` | igraph's own default. |
+/// | `n_iterations` | `-1` | iterate until stable for a converged partition (igraph's examples use 2). |
+/// | `start` | `false` | start from singletons, unless warm-starting from a previous run (e.g. a resolution sweep, which should ascend from low to high γ). |
+///
+/// # Returns
+///
+/// The [`Outcome`] with the number of clusters and the quality (the value
+/// of the objective function above) of the final partition.
+///
+/// # Examples
+///
+/// ```
+/// use leiden_rs::{leiden, Graph, Pcg32};
+///
+/// // Two triangles joined by a bridge edge.
+/// let graph = Graph::new(
+///     6,
+///     false,
+///     &[(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5), (0, 3)],
+/// )
+/// .unwrap();
+///
+/// let mut membership = Vec::new();
+/// let mut rng = Pcg32::seeded(42);
+/// let outcome = leiden(
+///     &graph,
+///     None,  // edge weights: all 1
+///     None,  // vertex out-weights: all 1
+///     None,  // vertex in-weights (must be None for undirected graphs)
+///     0.05,  // resolution γ
+///     0.01,  // beta
+///     false, // start from singletons
+///     -1,    // iterate until stable
+///     &mut membership,
+///     &mut rng,
+/// )
+/// .unwrap();
+///
+/// // At this low resolution the bridge merges both triangles.
+/// assert_eq!(outcome.nb_clusters, 1);
+///
+/// // A higher resolution separates the two triangles; warm-start the run
+/// // from the previous membership (start = true).
+/// let outcome = leiden(
+///     &graph, None, None, None,
+///     0.5,   // resolution γ
+///     0.01,  // beta
+///     true,  // start from the current membership
+///     -1,    // iterate until stable
+///     &mut membership,
+///     &mut rng,
+/// )
+/// .unwrap();
+///
+/// assert_eq!(outcome.nb_clusters, 2);
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     graph: &Graph,
@@ -1504,7 +1612,97 @@ pub fn leiden_simple_parallel(
     )
 }
 
-/// Sequential, bit-exact port of `igraph_community_leiden_simple()`.
+/// Sequential, bit-exact port of `igraph_community_leiden_simple()` — the
+/// simplified public interface, choosing from a set of objective functions
+/// ([`Objective`]) instead of supplying raw vertex weights.
+///
+/// Computes the vertex weights internally, just as the C function does:
+///
+/// - [`Objective::Modularity`]: vertex strengths ([`strength`]), with the
+///   resolution normalized by the total edge weight, so the returned
+///   quality is the (generalized) modularity;
+/// - [`Objective::Cpm`]: unit vertex weights, with the resolution entering
+///   the Constant Potts Model directly;
+/// - [`Objective::Er`]: unit vertex weights, with the resolution scaled by
+///   the (weighted) graph density.
+///
+/// Given the same seed and inputs, the result is bit-for-bit identical to
+/// C igraph's `igraph_community_leiden_simple()`, including its random
+/// number stream. Use [`Pcg32`] as the RNG for that guarantee.
+///
+/// # Parameters
+///
+/// - `graph`: undirected edges are stored with `from >= to` (igraph's
+///   convention); self-loops are allowed.
+/// - `weights`: edge weights; `None` means every edge has weight 1. Must
+///   not be negative for the [`Objective::Modularity`] and
+///   [`Objective::Er`] objectives; may be negative for [`Objective::Cpm`].
+/// - `objective`: the objective function, see above.
+/// - `resolution`: γ. For [`Objective::Modularity`] it is normalized by
+///   the total edge weight internally; for the other objectives it enters
+///   the objective directly. Larger resolutions give more, smaller
+///   communities.
+/// - `beta`: the randomness of the refinement phase's split decisions;
+///   `0.01` is igraph's default.
+/// - `start`: start from the given membership vector (`true`, which
+///   requires it to have length `vcount`) or from a singleton partition
+///   (`false`, which (re)fills the membership vector with singletons).
+/// - `n_iterations`: number of times to run the core Leiden algorithm. A
+///   negative value keeps iterating until an iteration does not change the
+///   clustering.
+/// - `membership`: both used as the initial membership (when `start` is
+///   `true`) and updated in place with the final partition (consecutive
+///   cluster indices starting at 0).
+/// - `rng`: the random number generator; [`Pcg32::seeded`] reproduces
+///   igraph's stream.
+///
+/// # Sensible defaults
+///
+/// | Parameter | Default | Rationale |
+/// |---|---|---|
+/// | `resolution` | `1.0` | γ = 1 for modularity; for CPM the natural scale depends on the average degree — sweep it with [`resolution_profile`] or [`resolution_profile_bisect`]. |
+/// | `beta` | `0.01` | igraph's own default. |
+/// | `n_iterations` | `-1` | iterate until stable for a converged partition (igraph's examples use 2). |
+/// | `start` | `false` | start from singletons, unless warm-starting from a previous run (e.g. a resolution sweep, which should ascend from low to high γ). |
+///
+/// # Returns
+///
+/// The [`Outcome`] with the number of clusters and the quality of the
+/// final partition. For [`Objective::Modularity`] the quality is the
+/// (generalized) modularity, comparable with the independent
+/// [`modularity`] port; quality values are not comparable across
+/// *different* resolutions, since the objective changes with γ.
+///
+/// # Examples
+///
+/// ```
+/// use leiden_rs::{leiden_simple, Graph, Objective, Pcg32};
+///
+/// let graph = Graph::new(
+///     10,
+///     false,
+///     &[(0, 1), (0, 2), (0, 3), (0, 4), (5, 6), (5, 7), (0, 5)],
+/// )
+/// .unwrap();
+///
+/// let mut membership: Vec<i64> = Vec::new(); // filled with singletons
+/// let mut rng = Pcg32::seeded(123);
+/// let outcome = leiden_simple(
+///     &graph,
+///     None,                   // edge weights (None = unweighted)
+///     Objective::Modularity,  // objective function
+///     1.0,                    // resolution γ
+///     0.01,                   // beta
+///     false,                  // start from singletons
+///     -1,                     // iterate until stable
+///     &mut membership,
+///     &mut rng,
+/// )
+/// .unwrap();
+///
+/// // Two star communities plus the two isolated vertices 8 and 9.
+/// assert_eq!(outcome.nb_clusters, 4);
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn leiden_simple(
     graph: &Graph,

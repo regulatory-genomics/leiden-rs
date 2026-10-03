@@ -88,6 +88,74 @@ For directed graphs the generic `leiden()` interface takes explicit vertex
 out/in weight vectors; `leiden_simple()` computes them via `strength()`
 just as `igraph_community_leiden_simple()` does.
 
+## Resolution profile
+
+`resolution_profile()` sweeps the resolution parameter over a range and
+returns the optimal partition at each resolution, as `ProfileEntry` values
+(resolution, number of communities, quality, internal edge weight and the
+membership vector):
+
+```rust
+use leiden_rs::{resolution_profile, Graph, Objective, Pcg32};
+
+let mut rng = Pcg32::seeded(42);
+let profile = resolution_profile(
+    &graph,
+    None,                    // edge weights (None = unweighted)
+    Objective::Cpm,          // objective function
+    &[0.1, 0.5, 1.0, 2.0],   // resolutions to scan
+    0.01,                    // beta (refinement randomness)
+    -1,                      // number of iterations (-1 = until stable)
+    &mut rng,
+)
+.unwrap();
+
+for entry in &profile {
+    println!(
+        "γ={:.3}: {} communities (quality={:.4})",
+        entry.resolution, entry.num_communities, entry.quality
+    );
+}
+```
+
+The sweep goes from low to high resolution and warm-starts each run from
+the previous partition, so subsequent runs converge in far fewer iterations
+than independent cold starts.
+
+The **bisection sweep** (`resolution_profile_bisect()`, mirroring
+leidenalg's `Optimiser.resolution_profile()`) instead binary-searches for
+the resolutions where the partition actually changes — the optimal
+partition is piecewise-constant in γ, so an interval stops being subdivided
+when its endpoints have the same partition (up to `min_diff_bisect_value`
+internal edges) or the resolution gap falls below `min_diff_resolution`
+(logarithmic gap by default, `linear_bisection` for linear). This finds
+every *distinct* partition over a wide γ range at a fraction of the cost of
+a dense grid, which can miss jump points entirely:
+
+```rust
+use leiden_rs::{resolution_profile_bisect, Objective, Pcg32};
+
+let mut rng = Pcg32::seeded(42);
+let profile = resolution_profile_bisect(
+    &graph,
+    None,
+    Objective::Cpm,
+    (0.01, 10.0), // resolution range (low, high)
+    0.01,         // beta
+    -1,           // number of iterations
+    1e-3,         // min_diff_resolution (bisection precision)
+    1.0,          // min_diff_bisect_value (a single edge does not trigger)
+    false,        // linear bisection? (false = logarithmic)
+    &mut rng,
+)
+.unwrap();
+```
+
+Note that quality values are not comparable across entries with different
+resolutions (the objective itself changes with γ); use the number of
+communities, the internal edge weight, or a fixed-γ recomputation (e.g.
+`modularity()`) to compare partitions across the profile.
+
 ## Tests
 
 All gates are checked by `cargo test`:
@@ -109,6 +177,11 @@ All gates are checked by `cargo test`:
   determinism across thread-pool configurations).
 - **RNG stream** (`tests/rng_stream_test.rs`): the PCG32 stream matches C
   values for `get_integer`, and uniform sampling.
+- **Resolution profile** (`tests/profile.rs` and unit tests in
+  `src/profile.rs`): linear-scan determinism and ordering, warm-start
+  chaining matching manual `leiden_simple` calls, bisection finding every
+  partition transition with few probes, quality cross-checked against the
+  independent `modularity()` port, and input validation.
 
 ### Differential harness
 
@@ -212,7 +285,3 @@ remaining cases — on some graphs a differently-seeded refinement
 converges in more iterations, which can make the parallel variant
 slower than sequential (e.g. random-100k-w CPM until stable). Choose
 based on workload; the sequential port remains the bit-exact reference.
-
-## License
-
-GPL-2.0-or-later, matching the igraph sources this port is derived from.
